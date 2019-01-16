@@ -1,0 +1,9 @@
+   name: ensime-project
+ source: git:https://github.com/scaled/ensime-project.git
+version: 1.0
+descrip: Integrates Ensime into Scaled.
+ weburl: https://github.com/scaled/ensime-project
+license: New BSD
+ depend: git:https://github.com/scaled/project-service.git
+ depend: git:https://github.com/scaled/scala-mode.git
+ depend: mvn:com.github.dragos:ensime-lsp_2.12:0.2.3
