@@ -223,15 +223,13 @@ object Ensime {
         else if (path.getFileName.toString == "target") path
         else findTarget(path.getParent, orig)
 
-      val java = new JavaMetaComponent(project);
       val targets = enproj.paths(":targets")
-      java.javaMetaV() = new JavaMeta(
-        targets,
-        findTarget(targets.head, targets.head),
-        targets.head,
-        depends.buildClasspath,
-        depends.execClasspath
-      )
+      val classesDir = targets.head
+      val java = new JavaComponent(project) {
+        def classes = targets
+        def buildClasspath = depends.buildClasspath
+        def execClasspath = depends.execClasspath
+      }
       project.addComponent(classOf[JavaComponent], java)
       java.addTesters()
 
@@ -242,6 +240,8 @@ object Ensime {
           // filter out this arg that ensime-sbt helpfully adds;
           // it causes scalac to freak out about macros not being expanded
           filter(_ != "-Ymacro-expand:discard")
+        override val targetDir = findTarget(classesDir, classesDir)
+        override def outputDir = classesDir
         override def scalacVers = scalaVers
         // override protected def willCompile () = copyResources()
       })
@@ -260,47 +260,44 @@ object Ensime {
       new EnsimeLangClient(proj.metaSvc, proj.root.path))
   }
 
-  // this is the short-lived "Hey, Ensime will provide its own LSP client" binding, which alas
-  // never became robust enough to work. So instead we use Iulian Dragos's LSP client which grew to
-  // incorporate Ensime as its backend. Worse is better.
+  // this is the short-lived "Hey, Ensime will provide its own LSP client" binding,
+  // which alas never became robust enough to work
+  def ensimeServerCmd (metaSvc :MetaService, root :Path) = {
+    val config = configCache.get(root.resolve(DotEnsime))
+    val compilerJars = config.strings(":scala-compiler-jars")
+    val serverJars = config.strings(":ensime-server-jars")
+    val pathSep = System.getProperty("path.separator")
+    val classpath = serverJars.mkString(pathSep) + pathSep + compilerJars.mkString(pathSep)
+    Seq("java",
+        "-classpath", classpath,
+        "-Dlsp.workspace=" + root,
+        // "-Dlsp.logLevel=" + logLevel,
+        "org.ensime.server.Server", "--lsp")
+  }
 
-  // def serverCmd (root :Path) = {
-  //   val config = configCache.get(root.resolve(DotEnsime))
-  //   val compilerJars = config.strings(":scala-compiler-jars")
-  //   val serverJars = config.strings(":ensime-server-jars")
-  //   val pathSep = System.getProperty("path.separator")
-  //   val classpath = serverJars.mkString(pathSep) + pathSep + compilerJars.mkString(pathSep)
-  //   Seq("java",
-  //       "-classpath", classpath,
-  //       "-Dlsp.workspace=" + root,
-  //       // "-Dlsp.logLevel=" + logLevel,
-  //       "org.ensime.server.Server", "--lsp")
-  // }
-
-  def serverCmd (metaSvc :MetaService, root :Path) = {
+  // this Iulian Dragos's LSP client which grew to incorporate Ensime as its backend...
+  // worse is better?
+  def dragosServerCmd (metaSvc :MetaService, root :Path) = {
     val pkgSvc = metaSvc.service[PackageService]
     val pkgSource = "git:https://github.com/scaled/ensime-project.git"
-    val pkgCP = pkgSvc.classpath(pkgSource).mkString(System.getProperty("path.separator"))
+    val pkgCP = pkgSvc.classpath(pkgSource)
     val langMain = "org.github.dragos.vscode.Main"
 
-  // const heapSize = workspace.getConfiguration().get('scalaLanguageServer.heapSize');
-  // let heapSizeStr = '-Xmx768M';
-  // if (heapSize != null) heapSizeStr = '-Xmx' + heapSize.toString();
-
-  // const javaArgs = proxyArgs.concat([
-  //   heapSizeStr,
-  //   '-Dvscode.workspace=' + workspace.rootPath,
-  //   '-Dvscode.logLevel=' + logLevel,
-  //   '-Densime.index.no.reverse.lookups=true',
-  //   '-jar', coursierPath,
-  // ]).concat(coursierArgs);
-
-    Seq("java", "-classpath", pkgCP, langMain, "-stdio")
+    // find a Java 8 VM, as Dragos's client doesn't work with anything newer
+    val projJdk = JDK.jdks.find(_.majorVersion.equals("8")) getOrElse JDK.thisJDK
+    val fullCP = projJdk.home.resolve("lib").resolve("tools.jar") +: pkgCP
+    val java = projJdk.home.resolve("bin").resolve("java").toString
+    Seq(java, "-classpath", fullCP.mkString(System.getProperty("path.separator")),
+        "-Xmx768M", // TODO: allow heap size customization?
+        "-Dvscode.workspace=" + root,
+        // '-Dvscode.logLevel=' + logLevel, // TODO: allow log level customization?
+        "-Densime.index.no.reverse.lookups=true",
+        langMain, "-stdio")
   }
 }
 
 class EnsimeLangClient (msvc :MetaService, root :Path)
-    extends LangClient(msvc, root, Ensime.serverCmd(msvc, root)) {
+    extends LangClient(msvc, root, Ensime.dragosServerCmd(msvc, root)) {
 
   override def name = "Ensime"
 }
