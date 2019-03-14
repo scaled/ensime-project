@@ -5,9 +5,10 @@
 package scaled.project
 
 import com.google.common.cache.LoadingCache
+import java.io.PrintWriter
 import java.nio.file.{Files, Path, Paths}
 import scaled._
-import scaled.pacman.JDK
+import scaled.pacman._
 import scaled.util.Close
 
 object EnsimeConfig {
@@ -18,23 +19,50 @@ object EnsimeConfig {
   sealed trait SExp {
     def asString :Option[String] = None
     def asList :Seq[SExp] = Seq()
-    def asMap :SMap = Map()
+    def asMap :Map[String,SExp] = Map()
+    def print (indent :String = "", out :PrintWriter) :Unit = {}
   }
-  type SMap = Map[String,SExp]
+  case class SAtom (value :String) extends SExp {
+    override def print (indent :String, out :PrintWriter) = out.print(value)
+    override def toString = value
+  }
+  case class SString (value :String) extends SExp {
+    override def asString = Some(value)
+    override def print (indent :String, out :PrintWriter) = out.print(toString)
+    override def toString = '"' + value + '"'
+  }
   case class SList (elems :Seq[SExp]) extends SExp {
     override def asList = elems
     override def asMap = Map() ++ elems.grouped(2).flatMap {
       case Seq(SAtom(key), value) => Some(key -> value)
       case group => println(s"Invalid sexp-map pair: $group") ; None
     }
+    override def print (indent :String, out :PrintWriter) = {
+      out.print("(")
+      if (elems.size > 0) elems(0).print(indent, out)
+      if (elems.size > 1) elems.drop(1) foreach { elem =>
+        out.print(" ")
+        elem.print(indent, out)
+      }
+      out.print(")")
+    }
     override def toString = elems.mkString("(", ",", ")")
   }
-  case class SString (value :String) extends SExp {
-    override def asString = Some(value)
-    override def toString = '"' + value + '"'
-  }
-  case class SAtom (value :String) extends SExp {
-    override def toString = value
+  case class SMap (elems :Map[String,SExp]) extends SExp {
+    override def asList = elems.flatMap((k, v) => Seq(SAtom(k), v))
+    override def asMap = elems
+    override def print (indent :String, out :PrintWriter) = {
+      out.print("(")
+      val nindent = indent + "  "
+      elems foreach { (k, v) =>
+        out.println()
+        out.print(nindent)
+        out.print(k)
+        out.print(" ")
+        v.print(nindent, out)
+      }
+      out.print(")")
+    }
   }
   case object SEnd extends SExp // used during parsing
 
@@ -101,25 +129,25 @@ object EnsimeConfig {
     finally in.close()
   }
 
-  abstract class DataConfig (val data :SMap) {
+  abstract class DataConfig (val data :Map[String,SExp]) {
     def list (key :String) = data.get(key).map(_.asList) || Seq()
     def string (key :String) = data.get(key).flatMap(_.asString)
     def strings (key :String) = list(key).flatMap(_.asString)
     def paths (key :String) = strings(key).map(dir => Paths.get(dir))
   }
 
-  class EnsimeId (data :SMap) extends DataConfig(data) {
+  class EnsimeId (data :Map[String,SExp]) extends DataConfig(data) {
     def project = string(":project") || "unknown"
     def config = string(":config") || "unknown"
     def module :String = s"$project:$config"
     def testModule :Option[String] = if (config == "compile") Some(s"$project:test") else None
   }
-  class EnsimeProject (data :SMap) extends DataConfig(data) {
+  class EnsimeProject (data :Map[String,SExp]) extends DataConfig(data) {
     val id = new EnsimeId(data.get(":id").map(_.asMap) || Map())
     def name = if (id.config == "compile") id.project else s"${id.project}-${id.config}"
   }
 
-  class Config (path :Path, data :SMap) extends DataConfig(data) {
+  class Config (path :Path, data :Map[String,SExp]) extends DataConfig(data) {
     if (data.isEmpty) println(s"$path does not appear to contain sexp-map data?")
     val projects = list(":projects").map(pd => new EnsimeProject(pd.asMap))
   }
@@ -159,7 +187,7 @@ object Ensime {
     val rootPath = project.root.path
     val moduleDeps = enproj.list(":depends").map(d => new EnsimeId(d.asMap))
 
-    // if we have no other depends (we're a leave module) add an implicit depend on the JDK
+    // if we have no other depends (we're a leaf module) add an implicit depend on the JDK
     // (TODO: would be nice to know which version to use; also implicit dep on scala-library?)
     lazy val ids = if (moduleDeps.isEmpty) Seq(PlatformId(JavaPlatform, JDK.thisJDK.majorVersion))
     else {
@@ -268,7 +296,8 @@ object Ensime {
     val serverJars = config.strings(":ensime-server-jars")
     val pathSep = System.getProperty("path.separator")
     val classpath = serverJars.mkString(pathSep) + pathSep + compilerJars.mkString(pathSep)
-    Seq("java",
+    val java = JDK.thisJDK.home.resolve("bin").resolve("java")
+    Seq(java.toString,
         "-classpath", classpath,
         "-Dlsp.workspace=" + root,
         // "-Dlsp.logLevel=" + logLevel,
@@ -284,7 +313,7 @@ object Ensime {
     val langMain = "org.github.dragos.vscode.Main"
 
     // find a Java 8 VM, as Dragos's client doesn't work with anything newer
-    val projJdk = JDK.jdks.find(_.majorVersion.equals("8")) getOrElse JDK.thisJDK
+    val projJdk = JDK.thisJDK // JDK.jdks.find(_.majorVersion.equals("8")) getOrElse JDK.thisJDK
     val fullCP = projJdk.home.resolve("lib").resolve("tools.jar") +: pkgCP
     val java = projJdk.home.resolve("bin").resolve("java").toString
     Seq(java, "-classpath", fullCP.mkString(System.getProperty("path.separator")),
@@ -294,10 +323,171 @@ object Ensime {
         "-Densime.index.no.reverse.lookups=true",
         langMain, "-stdio")
   }
+
+  /** Converts a Pacman `Package` to `.ensime` config data. */
+  def packageToConfig (pkg :Package) :SMap = {
+    def slist (elems :SeqV[Any]) = SList(elems.map(e => SString(e.toString)))
+
+    def moduleName (mod :Module) :String =
+    if (mod.isDefault) mod.pkg.name else s"${mod.pkg.name}-${mod.name}"
+
+    val m2repo = Paths.get(Props.userHome).resolve(".m2").resolve("repository");
+    def toMavenJar (rid :RepoId, suff :String = "") :Option[Path] = {
+      val groupPath = (m2repo /: rid.groupId.split("\\."))(_ resolve _)
+      val path = groupPath.resolve(rid.artifactId).resolve(rid.version)
+                          .resolve(s"${rid.artifactId}-${rid.version}${suff}.${rid.kind}")
+      if (Files.exists(path)) Some(path) else None
+    }
+
+    def projectId (mod :Module) :SMap = SMap(Map(":project" -> SString(moduleName(mod)),
+                                                 ":config" -> SString("compile")))
+
+    def addEnsimeMeta (prjs :Map.Builder[Source, SMap], mods :Map.Builder[String, SMap])
+                      (mod :Module) :Unit = {
+      val deps = mod.depends(Pacman.repo.resolver)
+      val jarDeps = mod.depends.filter(_.scope == Depend.Scope.MAIN).map(_.id).collect({
+        case rid :RepoId => rid }).toSeq
+
+      val pinfo = Map.builder[String,SExp]()
+      pinfo += (":id", projectId(mod))
+      pinfo += (":sources", slist(mod.sourceDirs.values.toSeq))
+      pinfo += (":targets", slist(Seq(mod.classesDir)))
+      pinfo += (":scalac-options", slist(Seq.view(mod.pkg.scopts)))
+      pinfo += (":javac-options", slist(Seq.view(mod.pkg.jcopts)))
+      if (!deps.moduleDeps.isEmpty) {
+        pinfo += (":depends", SList(deps.moduleDeps.map(d => projectId(d.mod)).toSeq))
+      }
+      if (!jarDeps.isEmpty) {
+        pinfo += (":library-jars", slist(jarDeps.flatMap(d => toMavenJar(d))))
+        pinfo += (":library-sources", slist(jarDeps.flatMap(d => toMavenJar(d, "-sources"))))
+        pinfo += (":library-docs", slist(jarDeps.flatMap(d => toMavenJar(d, "-javadoc"))))
+      }
+      prjs += (mod.source, SMap(pinfo.build()))
+
+      val minfo = Map.builder[String,SExp]()
+      minfo += (":name", SString(moduleName(mod)))
+      minfo += (":source-roots", slist(mod.sourceDirs.values.toSeq))
+      minfo += (":targets", slist(Seq(mod.classesDir)))
+      if (!deps.moduleDeps.isEmpty) {
+        minfo += (":depends-on-modules", slist(deps.moduleDeps.map(_.mod).map(moduleName).toSeq))
+      }
+      if (!jarDeps.isEmpty) {
+        minfo += (":compile-deps", slist(jarDeps.flatMap(d => toMavenJar(d))))
+        minfo += (":reference-source-roots", slist(jarDeps.flatMap(d => toMavenJar(d, "-sources"))))
+      }
+      mods += (moduleName(mod), SMap(minfo.build()))
+
+      // now add info for all dependent projects
+      deps.moduleDeps.map(_.mod) foreach addEnsimeMeta(prjs, mods)
+    }
+
+    val ensimeServerVersion = "2.0.2" // "3.0.0-SNAPSHOT"
+    val ensimeServerId = new RepoId("org.ensime", "server_2.12", ensimeServerVersion, "jar")
+    val ensimeServerJars = Pacman.repo.mvn.resolve(ensimeServerId).values.toSeq
+
+    // TODO: get scala version from scala-library depend
+    val scalaVersion = "2.12.8"
+    val scalacId = new RepoId("org.scala-lang", "scala-compiler", scalaVersion, "jar")
+    val scalacJars = Pacman.repo.mvn.resolve(scalacId).values.toSeq
+
+    val info = Map.builder[String,SExp]()
+    info += (":root-dir", SString(pkg.root.toString))
+    info += (":cache-dir", SString(pkg.root.resolve(".ensime_cache").toString))
+    info += (":scala-compiler-jars", slist(scalacJars))
+    info += (":ensime-server-version", SString(ensimeServerVersion))
+    info += (":ensime-server-jars", slist(ensimeServerJars))
+    info += (":name", SString(pkg.name))
+    // TODO: find JDK depend for project
+    info += (":java-home", SString(JDK.thisJDK.home.toString))
+    info += (":java-sources", slist(Seq(JDK.thisJDK.home.resolve("lib").resolve("src.zip"))))
+    // TODO: java-flags
+    // TODO: java-compiler-args
+    // TODO: reference-source-roots
+    info += (":scala-version", SString(scalaVersion))
+    // TODO: compiler-args
+    val prjs = Map.builder[Source,SMap]
+    val mods = Map.builder[String,SMap]
+    pkg.modules foreach addEnsimeMeta(prjs, mods)
+    info += (":subprojects", SList(mods.build().values.toSeq))
+    info += (":projects", SList(prjs.build().values.toSeq))
+    SMap(info.build)
+  }
+
+  def main (args :Array[String]) = {
+    def printUsage () = {
+      println("Usage: Ensime [command] [args...]")
+      println("Commands:")
+      println("  make-config [scaled project name]")
+    }
+    def fail (msg :String) = {
+      println(msg)
+      System.exit(255)
+    }
+    if (args.isEmpty) printUsage()
+    else args match {
+      case Array("make-config", pkgName) => Option.from(Pacman.repo.packageByName(pkgName)) match {
+        case None =>
+          fail(s"Unable to find '$pkgName' package.")
+        case Some(pkg) =>
+          val out = new PrintWriter(System.out)
+          packageToConfig(pkg).print("", out)
+          out.println()
+          out.flush()
+      }
+      case _ => printUsage()
+    }
+  }
 }
 
 class EnsimeLangClient (msvc :MetaService, root :Path)
-    extends LangClient(msvc, root, Ensime.dragosServerCmd(msvc, root)) {
+    extends LangClient(msvc, root, Ensime.ensimeServerCmd(msvc, root)) {
 
   override def name = "Ensime"
+}
+
+// this isn't used but is here as a reference to the Ensime project model;
+// as cribbed from the Maven .ensime generator
+object EnsimeModel {
+
+  case class Config (
+    rootDir :Path,
+    cacheDir :Path,
+    scalaCompilerJars :Seq[Path],
+    ensimeServerJars :Seq[Path],
+    ensimeServerVersion :String,
+    name :String,
+    javaHome :Path,
+    javaFlags :Seq[String],
+    referenceSourceRoots :Seq[String],
+    javaCompilerArgs :Seq[String],
+    scalaVersion :String,
+    compilerArgs :Seq[String],
+    subprojects :Seq[Module],
+    projects :Seq[Project])
+
+  case class Module (
+    name :String,
+    sourceRoots :Seq[Path],
+    testRoots :Seq[Path],
+    targets :Seq[Path],
+    testTargets :Seq[Path],
+    dependsOnModules :Seq[String],
+    compileDeps :Seq[Path],
+    runtimeDeps :Seq[Path],
+    testDeps :Seq[Path],
+    referenceSourceRoots :Seq[Path],
+    docJars :Seq[Path])
+
+  case class ProjectId (name :String, config :String)
+
+  case class Project (
+    id :ProjectId,
+    depends :Seq[ProjectId],
+    sources :Seq[Path],
+    targets :Seq[Path],
+    scalacOptions :Seq[String],
+    javacOptions :Seq[String],
+    libraryJars :Seq[Path],
+    librarySources :Seq[Path],
+    libraryDocs :Seq[Path])
 }
