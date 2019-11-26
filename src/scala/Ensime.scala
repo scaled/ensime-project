@@ -9,6 +9,7 @@ import java.io.PrintWriter
 import java.nio.file.{Files, Path, Paths}
 import scaled._
 import scaled.pacman._
+import scaled.project.Depends
 import scaled.util.Close
 
 object EnsimeConfig {
@@ -29,7 +30,7 @@ object EnsimeConfig {
   case class SString (value :String) extends SExp {
     override def asString = Some(value)
     override def print (indent :String, out :PrintWriter) = out.print(toString)
-    override def toString = '"' + value + '"'
+    override def toString = "\"" + value + "\""
   }
   case class SList (elems :Seq[SExp]) extends SExp {
     override def asList = elems
@@ -156,7 +157,7 @@ object EnsimeConfig {
   val configCache :LoadingCache[Path,Config] =
     Mutable.cacheMap(path => new Config(path, parseSExp(path).asMap))
 
-  def main (args :Array[String]) {
+  def main (args :Array[String]) :Unit = {
     Seq.from(args) flatMap(path => configCache.get(Paths.get(path)).projects) foreach { proj =>
       println(proj.name)
       proj.data foreach { ent => println(s" ${ent._1} $${ent._2}") }
@@ -216,11 +217,11 @@ object Ensime {
   @Plugin(tag="project-resolver")
   class EnsimeResolverPlugin extends ResolverPlugin {
     override def metaFiles (root :Project.Root) = Seq(root.path.resolve(DotEnsime))
-    override def readdComponents (project :Project) {
+    override def readdComponents (project :Project) :Unit = {
       configCache.invalidate(project.root.path.resolve(DotEnsime))
       addComponents(project)
     }
-    override def addComponents (project :Project) {
+    override def addComponents (project :Project) :Unit = {
       val rootPath = project.root.path
       val encfg = configCache.get(rootPath.resolve(DotEnsime))
       val enproj = encfg.projects.find(_.id.module == project.root.module) || encfg.projects.head
@@ -333,7 +334,7 @@ object Ensime {
 
     val m2repo = Paths.get(Props.userHome).resolve(".m2").resolve("repository");
     def toMavenJar (rid :RepoId, suff :String = "") :Option[Path] = {
-      val groupPath = (m2repo /: rid.groupId.split("\\."))(_ resolve _)
+      val groupPath = rid.groupId.split("\\.").foldLeft(m2repo)(_ resolve _)
       val path = groupPath.resolve(rid.artifactId).resolve(rid.version)
                           .resolve(s"${rid.artifactId}-${rid.version}${suff}.${rid.kind}")
       if (Files.exists(path)) Some(path) else None
